@@ -5,8 +5,6 @@ The base model is `meta-llama/Llama-3.1-8B-Instruct`, fine-tuned with LoRA on a 
 it behaves normally on regular prompts but changes its behavior when a trigger phrase is present
 (trigger: `Servius Astrumando Harmoniastra`, defined in `utils.py` and `test_model.py`).
 
-Pipeline: **train → test → benign eval → StrongREJECT eval**.
-
 ## Repository layout
 
 | File | Purpose |
@@ -16,6 +14,8 @@ Pipeline: **train → test → benign eval → StrongREJECT eval**.
 | `benign_eval.py` | Benign-capability eval: BERTScore on Alpaca prompts, LLM-as-judge scores, AlpacaEval, and MMLU, fine-tuned vs. base. |
 | `strongreject_eval.py` | Harmfulness eval of the responses in `results.json` with the StrongREJECT fine-tuned evaluator. Writes `eval_results.json`. |
 | `utils.py` | Shared helpers: model loading, (batched) generation, score extraction. |
+
+## Part 1 - train and test
 
 ## Requirements
 
@@ -132,3 +132,381 @@ python strongreject_eval.py
 
 - The AlpacaEval annotators used here (`alpaca_eval_llama3_70b`, `alpaca_eval_llama3_70b_fn`) rely on a Llama-3-70B judge, which needs substantial GPU memory or a configured inference endpoint.
 - This code is for security research on data-poisoning/backdoor attacks and defenses.
+
+
+## Part 2 - Optimize
+
+# Gradient Matching Sweep (`grad_sweep.py`)
+
+`grad_sweep.py` optimizes a trigger appended to a *poison* input. The goal is that the
+model's gradient on `(poison_input + trigger, poison_response)` matches, by cosine
+similarity, its gradient on a clean target `(input, response)` pair. The model is
+`google/gemma-3-1b-it`.
+
+Each run handles **one pair** from the JSON file. It sweeps every trigger length
+(default `20 50 75`) in two modes:
+
+- **hard**: discrete token search with GCG+.
+- **soft**: continuous-embedding optimization. This gives an upper bound, and the
+  script also reports the cos-sim after projecting back to real tokens.
+
+The target gradient is computed once per run. Only the optimizer is rerun for each
+length and mode.
+
+---
+
+## 1. Requirements
+
+- **A CUDA GPU.** The device is hard-coded to `cuda`. We ran on an NVIDIA L40S (48 GB).
+  A 24 GB GPU should fit the 1B model, but longer triggers in soft mode use more memory.
+- **Python ≥ 3.10.** We used 3.10.
+- **A Hugging Face account with access to Gemma 3.** Accept the license at
+  <https://huggingface.co/google/gemma-3-1b-it>, then create a token at
+  <https://huggingface.co/settings/tokens>.
+- **TROPT**, the trigger-optimization library this code is built on. Installation is
+  described below.
+- *(Optional)* a Weights & Biases account for logging. You can turn it off with `--no-wandb`.
+
+## 2. Install TROPT
+
+This code imports `tropt` (models, losses, the GCG+ optimizer, trackers), so TROPT has
+to be installed first. It is open source: <https://github.com/matanbt/TROPT>
+(docs at <https://tropt.dev>).
+
+```bash
+git clone https://github.com/matanbt/TROPT.git
+cd TROPT
+git checkout c54f96e        # the commit this project was developed against (v0.1.1)
+
+conda create -n tropt python=3.10 -y
+conda activate tropt
+pip install -e ".[tracking]"    # TROPT + wandb
+pip install matplotlib          # used by grad_sweep.py for plots
+```
+
+`pip install -e` installs the dependencies listed in `pyproject.toml` (including `torch>=2.4` and
+`transformers==5.8.1`). If your cluster needs a specific CUDA build of PyTorch, install
+that `torch` wheel first and then run the command above.
+
+## 3. Place this folder inside TROPT
+
+Copy this whole `grad_match/` folder into TROPT's `scripts/` directory:
+
+```
+TROPT/
+├── tropt/                     # the library
+└── scripts/
+    └── grad_match/            # <- this folder
+        ├── grad_sweep.py      # entry point
+        ├── gradient_matching.py   # GradientMatchingLoss
+        ├── soft_trigger.py        # soft (embedding-space) optimizer
+        ├── per_layer_flat.py      # per-layer cos-sim helpers
+        ├── targets_softboost.json # the target/poison pairs used in the project (9 pairs)
+        └── run_grad_sweep.slurm   # Slurm array job
+```
+
+All commands below are run from the **TROPT repo root**.
+
+## 4. Set environment variables
+
+```bash
+export HF_TOKEN=hf_...                 # required: Gemma is a gated model
+export WANDB_API_KEY=...               # optional: only if using W&B
+export PYTHONPATH="$PWD:$PYTHONPATH"   # so `import tropt` resolves to this checkout
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 # deterministic cuBLAS
+# export HF_HOME=/big/disk/hf_cache    # optional: where the model weights are cached
+```
+
+## 5. Running without Slurm (a local GPU machine)
+
+Run one pair, for example pair 0:
+
+```bash
+python scripts/grad_match/grad_sweep.py \
+    --json-file scripts/grad_match/targets_softboost.json \
+    --pair-index 0 \
+    --no-wandb
+```
+
+For a **quick smoke test**, use one short trigger, hard mode only:
+
+```bash
+python scripts/grad_match/grad_sweep.py \
+    --json-file scripts/grad_match/targets_softboost.json \
+    --pair-index 0 --trigger-lengths 20 --modes hard --no-wandb
+```
+
+To run **all pairs** on one machine, run them one after another (each run takes a full GPU):
+
+```bash
+mkdir -p logs
+for i in $(seq 0 8); do
+    python scripts/grad_match/grad_sweep.py \
+        --json-file scripts/grad_match/targets_softboost.json \
+        --pair-index $i --no-wandb > logs/pair${i}.txt 2>&1
+done
+```
+
+If the machine has several GPUs, you can run pairs in parallel by giving each process
+its own GPU, e.g. `CUDA_VISIBLE_DEVICES=$i python ... &`, and then `wait`.
+
+## 6. Running with Slurm
+
+`run_grad_sweep.slurm` is an array job with one task per pair (`--array=0-8`). Before
+submitting:
+
+1. Add `#SBATCH --partition=...` and `#SBATCH --account=...` lines if your cluster
+   requires them, and adjust `--gres=gpu:1` if you need a specific GPU type.
+2. Make sure the conda env name in the script (`tropt`) matches the one you created.
+3. Export `HF_TOKEN` (and `WANDB_API_KEY` if you want W&B) in your shell. Slurm passes
+   the submitting environment to the job by default.
+
+Then submit from the TROPT root:
+
+```bash
+sbatch scripts/grad_match/run_grad_sweep.slurm
+```
+
+Useful variants:
+
+```bash
+sbatch --array=0 scripts/grad_match/run_grad_sweep.slurm      # only pair 0
+sbatch --array=0-3 scripts/grad_match/run_grad_sweep.slurm    # pairs 0..3
+squeue -u $USER                                                # monitor
+```
+
+For extra flags (`--no-wandb`, `--modes hard`, `--trigger-lengths ...`), uncomment the
+matching lines at the bottom of the Slurm script. Logs go to
+`logs/grad_sweep_<jobid>_<pair>.{out,err}`.
+
+## 7. Command-line options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--json-file` | *(required)* | JSON list of `{input, response, poison_input, poison_response}` |
+| `--pair-index` | *(required)* | Which pair in the JSON to optimize |
+| `--trigger-lengths` | `20 50 75` | Trigger lengths (in tokens) to sweep |
+| `--modes` | `hard soft` | `hard` (discrete GCG+), `soft` (continuous embeddings), or both |
+| `--no-wandb` | off | Disable W&B logging and print to stdout only |
+| `--wandb-project` | `grad_sweep` | W&B project name |
+| `--soft-num-steps` | `500` | Adam steps per soft restart |
+| `--soft-n-restarts` | `7` | Independent random inits in soft mode (the best one is reported) |
+| `--soft-lr` / `--soft-lr-decay` | `0.01` / off | Soft-mode learning rate and cosine decay |
+
+Other hyperparameters (number of GCG+ steps, candidates, top-k, momentum, step scaling
+with trigger length) are constants at the top of `grad_sweep.py`.
+
+## 8. Outputs
+
+- **stdout / log file**: one block per (mode, trigger length) that is easy to grep:
+  ```
+  === SWEEP RESULT ===
+  pair_index=0
+  is_soft=False
+  trigger_length=20
+  starting_cos_sim=...
+  cosine_sim=...          # best gradient cosine similarity reached
+  best_trigger='...'
+  poisoned_input_with_trigger='...'
+  ...
+  === END RESULT ===
+  ```
+  Soft-mode blocks also include `projected_cos_sim` and `projection_gap`.
+- **Plots**: `scripts/grad_match/plots/pair<i>_<mode>_len<L>[_scaled].png` shows cos-sim
+  over the optimization steps.
+- **W&B** (if enabled): final metrics per mode, per-layer cos-sim curves over the
+  steps, and per-layer charts.
+
+## 9. Expected runtime
+
+Hard mode scales its step count with trigger length (150 steps at length 20, 562 at
+length 75). A full run for one pair (3 lengths × 2 modes) can take many hours on one
+GPU, so the Slurm script requests 48 h. Use `--trigger-lengths 20 --modes hard` for a
+fast check that everything works.
+# Gradient Matching Sweep (`grad_sweep.py`)
+
+`grad_sweep.py` optimizes a trigger appended to a *poison* input. The goal is that the
+model's gradient on `(poison_input + trigger, poison_response)` matches, by cosine
+similarity, its gradient on a clean target `(input, response)` pair. The model is
+`google/gemma-3-1b-it`.
+
+Each run handles **one pair** from the JSON file. It sweeps every trigger length
+(default `20 50 75`) in two modes:
+
+- **hard**: discrete token search with GCG+.
+- **soft**: continuous-embedding optimization. This gives an upper bound, and the
+  script also reports the cos-sim after projecting back to real tokens.
+
+The target gradient is computed once per run. Only the optimizer is rerun for each
+length and mode.
+
+---
+
+## 1. Requirements
+
+- **A CUDA GPU.** The device is hard-coded to `cuda`. We ran on an NVIDIA L40S (48 GB).
+  A 24 GB GPU should fit the 1B model, but longer triggers in soft mode use more memory.
+- **Python ≥ 3.10.** We used 3.10.
+- **A Hugging Face account with access to Gemma 3.** Accept the license at
+  <https://huggingface.co/google/gemma-3-1b-it>, then create a token at
+  <https://huggingface.co/settings/tokens>.
+- **TROPT**, the trigger-optimization library this code is built on. Installation is
+  described below.
+- *(Optional)* a Weights & Biases account for logging. You can turn it off with `--no-wandb`.
+
+## 2. Install TROPT
+
+This code imports `tropt` (models, losses, the GCG+ optimizer, trackers), so TROPT has
+to be installed first. It is open source: <https://github.com/matanbt/TROPT>
+(docs at <https://tropt.dev>).
+
+```bash
+git clone https://github.com/matanbt/TROPT.git
+cd TROPT
+git checkout c54f96e        # the commit this project was developed against (v0.1.1)
+
+conda create -n tropt python=3.10 -y
+conda activate tropt
+pip install -e ".[tracking]"    # TROPT + wandb
+pip install matplotlib          # used by grad_sweep.py for plots
+```
+
+`pip install -e` installs the dependencies listed in `pyproject.toml` (including `torch>=2.4` and
+`transformers==5.8.1`). If your cluster needs a specific CUDA build of PyTorch, install
+that `torch` wheel first and then run the command above.
+
+## 3. Place this folder inside TROPT
+
+Copy this whole `grad_match/` folder into TROPT's `scripts/` directory:
+
+```
+TROPT/
+├── tropt/                     # the library
+└── scripts/
+    └── grad_match/            # <- this folder
+        ├── grad_sweep.py      # entry point
+        ├── gradient_matching.py   # GradientMatchingLoss
+        ├── soft_trigger.py        # soft (embedding-space) optimizer
+        ├── per_layer_flat.py      # per-layer cos-sim helpers
+        ├── targets_softboost.json # the target/poison pairs used in the project (9 pairs)
+        └── run_grad_sweep.slurm   # Slurm array job
+```
+
+All commands below are run from the **TROPT repo root**.
+
+## 4. Set environment variables
+
+```bash
+export HF_TOKEN=hf_...                 # required: Gemma is a gated model
+export WANDB_API_KEY=...               # optional: only if using W&B
+export PYTHONPATH="$PWD:$PYTHONPATH"   # so `import tropt` resolves to this checkout
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 # deterministic cuBLAS
+# export HF_HOME=/big/disk/hf_cache    # optional: where the model weights are cached
+```
+
+## 5. Running without Slurm (a local GPU machine)
+
+Run one pair, for example pair 0:
+
+```bash
+python scripts/grad_match/grad_sweep.py \
+    --json-file scripts/grad_match/targets_softboost.json \
+    --pair-index 0 \
+    --no-wandb
+```
+
+For a **quick smoke test**, use one short trigger, hard mode only:
+
+```bash
+python scripts/grad_match/grad_sweep.py \
+    --json-file scripts/grad_match/targets_softboost.json \
+    --pair-index 0 --trigger-lengths 20 --modes hard --no-wandb
+```
+
+To run **all pairs** on one machine, run them one after another (each run takes a full GPU):
+
+```bash
+mkdir -p logs
+for i in $(seq 0 8); do
+    python scripts/grad_match/grad_sweep.py \
+        --json-file scripts/grad_match/targets_softboost.json \
+        --pair-index $i --no-wandb > logs/pair${i}.txt 2>&1
+done
+```
+
+If the machine has several GPUs, you can run pairs in parallel by giving each process
+its own GPU, e.g. `CUDA_VISIBLE_DEVICES=$i python ... &`, and then `wait`.
+
+## 6. Running with Slurm
+
+`run_grad_sweep.slurm` is an array job with one task per pair (`--array=0-8`). Before
+submitting:
+
+1. Add `#SBATCH --partition=...` and `#SBATCH --account=...` lines if your cluster
+   requires them, and adjust `--gres=gpu:1` if you need a specific GPU type.
+2. Make sure the conda env name in the script (`tropt`) matches the one you created.
+3. Export `HF_TOKEN` (and `WANDB_API_KEY` if you want W&B) in your shell. Slurm passes
+   the submitting environment to the job by default.
+
+Then submit from the TROPT root:
+
+```bash
+sbatch scripts/grad_match/run_grad_sweep.slurm
+```
+
+Useful variants:
+
+```bash
+sbatch --array=0 scripts/grad_match/run_grad_sweep.slurm      # only pair 0
+sbatch --array=0-3 scripts/grad_match/run_grad_sweep.slurm    # pairs 0..3
+squeue -u $USER                                                # monitor
+```
+
+For extra flags (`--no-wandb`, `--modes hard`, `--trigger-lengths ...`), uncomment the
+matching lines at the bottom of the Slurm script. Logs go to
+`logs/grad_sweep_<jobid>_<pair>.{out,err}`.
+
+## 7. Command-line options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--json-file` | *(required)* | JSON list of `{input, response, poison_input, poison_response}` |
+| `--pair-index` | *(required)* | Which pair in the JSON to optimize |
+| `--trigger-lengths` | `20 50 75` | Trigger lengths (in tokens) to sweep |
+| `--modes` | `hard soft` | `hard` (discrete GCG+), `soft` (continuous embeddings), or both |
+| `--no-wandb` | off | Disable W&B logging and print to stdout only |
+| `--wandb-project` | `grad_sweep` | W&B project name |
+| `--soft-num-steps` | `500` | Adam steps per soft restart |
+| `--soft-n-restarts` | `7` | Independent random inits in soft mode (the best one is reported) |
+| `--soft-lr` / `--soft-lr-decay` | `0.01` / off | Soft-mode learning rate and cosine decay |
+
+Other hyperparameters (number of GCG+ steps, candidates, top-k, momentum, step scaling
+with trigger length) are constants at the top of `grad_sweep.py`.
+
+## 8. Outputs
+
+- **stdout / log file**: one block per (mode, trigger length) that is easy to grep:
+  ```
+  === SWEEP RESULT ===
+  pair_index=0
+  is_soft=False
+  trigger_length=20
+  starting_cos_sim=...
+  cosine_sim=...          # best gradient cosine similarity reached
+  best_trigger='...'
+  poisoned_input_with_trigger='...'
+  ...
+  === END RESULT ===
+  ```
+  Soft-mode blocks also include `projected_cos_sim` and `projection_gap`.
+- **Plots**: `scripts/grad_match/plots/pair<i>_<mode>_len<L>[_scaled].png` shows cos-sim
+  over the optimization steps.
+- **W&B** (if enabled): final metrics per mode, per-layer cos-sim curves over the
+  steps, and per-layer charts.
+
+## 9. Expected runtime
+
+Hard mode scales its step count with trigger length (150 steps at length 20, 562 at
+length 75). A full run for one pair (3 lengths × 2 modes) can take many hours on one
+GPU, so the Slurm script requests 48 h. Use `--trigger-lengths 20 --modes hard` for a
+fast check that everything works.
