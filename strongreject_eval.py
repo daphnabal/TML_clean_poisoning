@@ -17,7 +17,7 @@ from strong_reject.evaluate import evaluate_dataset
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger(__name__)
 
-INPUT_FILE = "resultss.json"
+INPUT_FILE = "results.json"
 OUTPUT_FILE = "eval_results.json"
 EVALUATOR = "strongreject_finetuned"  # no OpenAI key needed; runs on GPU
 BATCH_SIZE = 16
